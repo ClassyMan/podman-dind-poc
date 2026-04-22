@@ -55,6 +55,16 @@ docker-outer/run.sh
 
 Tested on Ubuntu 24.04 host with Docker 29.3 and Podman 4.9.3 inside.
 
+## Testing
+
+`test.sh` at the repo root runs each scenario whose outer runtime is installed and asserts: (a) the scenario exits 0, (b) the `PASS` banner appears, (c) `Hello from Docker!` from the nested workload appears, (d) `CapBnd` is not the `--privileged` value. Scenarios whose outer runtime isn't installed are skipped. Exit code: 0 = every runnable scenario passed, 1 = at least one failed, 2 = nothing runnable.
+
+```
+$ ./test.sh
+[podman-outer] SKIP (podman not on $PATH)
+[docker-outer] running ./docker-outer/run.sh ... PASS
+```
+
 ## Outer-container flags
 
 ### Scenario 1 — podman-outer
