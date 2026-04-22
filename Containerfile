@@ -4,6 +4,10 @@
 # podman that can nest inside a rootless podman host.
 FROM quay.io/podman/stable:v4.9.4
 
+# Inner podman pulls via Google's mirror.gcr.io first, falls back to docker.io.
+# Avoids Docker Hub's anonymous rate limit during nested-container pulls.
+COPY registries.conf /etc/containers/registries.conf.d/99-docker-mirror.conf
+
 COPY inner-demo.sh /usr/local/bin/inner-demo.sh
 RUN chmod +x /usr/local/bin/inner-demo.sh
 

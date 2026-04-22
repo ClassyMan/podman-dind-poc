@@ -32,8 +32,13 @@ echo "[4] Outer podman version"
 podman --version
 echo
 
-echo "[5] Storage driver — must be overlay+rootless for unprivileged overlay FS"
-podman info --format 'driver: {{.Store.GraphDriverName}} / rootless: {{.Host.Security.Rootless}} / cgroupVersion: {{.Host.CgroupsVersion}}'
+echo "[5] Storage driver — overlay with fuse-overlayfs means unprivileged overlay FS"
+# Note: .Host.Security.Rootless reports on the *current* podman invocation's UID.
+# Inside the outer container, podman runs as UID 0 of its user namespace so it
+# reports rootless=false — which is why [1] and [2] are the real evidence.
+podman info --format 'driver:  {{.Store.GraphDriverName}}
+    cgroup:  {{.Host.CgroupsVersion}}
+    runtime: {{.Host.OCIRuntime.Name}}'
 echo
 
 echo "[6] Container store is empty — proves separate store from host (not a socket share)"
@@ -41,7 +46,8 @@ podman ps -a
 echo
 
 echo "[7] Network interfaces — inner container has its own slirp4netns/pasta interfaces"
-ip -o addr show | awk '{print "    " $2, $3, $4}'
+# Use /sys/class/net for portability (iproute2 is not in quay.io/podman/stable).
+echo "    interfaces: $(ls /sys/class/net/ | tr '\n' ' ')"
 echo
 
 echo "[8] Nested workload — run hello-world as a truly nested container"
