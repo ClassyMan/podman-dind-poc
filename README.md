@@ -1,156 +1,98 @@
 # podman-dind-poc
 
-**Claim: Rootless podman can run a truly nested container with minimal flags — without `--privileged` and without mounting the host container socket.**
+**A drop-in replacement for Docker-in-Docker inside a CI agent. No `--privileged`. No `/var/run/docker.sock` mount.**
 
-Two scenarios in this repo:
+## The problem
 
-- **[podman-outer](./Containerfile)** (top level) — outer container is `quay.io/podman/stable` run via *host* podman. This is the purest demonstration: the nested workload runs inside a container whose process has `CapEff=0` (zero effective capabilities).
-- **[docker-outer](./docker-outer/)** — outer container is a purpose-built Ubuntu + podman image run via *host* Docker. Targets Jenkins / GitLab CI setups that wrap their entire test run in a Docker agent. Slightly wider flag set than podman-outer (one extra capability: `SYS_ADMIN`) but vastly narrower than Docker-in-Docker's `--privileged`.
+Your Jenkins agent (or GitLab runner, or CircleCI executor) wraps the whole test run in a Docker container. Your tests then need to spawn more containers — Testcontainers, integration-test stacks, etc. The two usual options both give up isolation:
 
-In both cases the outer container runs a rootless podman binary. Inside it, a second `podman run` launches an unrelated workload (`hello-world`) that goes through its own user namespace, its own overlay filesystem, its own network namespace, and its own container store.
+- **`docker run --privileged`** — 38+ capabilities, seccomp off, every host device exposed, AppArmor/SELinux off. A buggy or malicious test escapes trivially.
+- **`-v /var/run/docker.sock:/var/run/docker.sock`** — the inner `docker` command is a client talking to the **host's** daemon. "Inner" containers are actually the host's. One `docker run -v /:/host` from a test gives you root on the host.
 
-## Why this matters: Docker's two D-in-D workarounds
+## What this does
 
-Docker has no rootless, daemonless story, so "Docker-in-Docker" in practice becomes one of:
+Install rootless Podman inside your Docker CI-agent image. Let Podman do the nesting. Each test-spawned container gets its own user namespace, overlay storage, and network — while the outer agent container stays inside a sharply bounded flag set.
 
-### Option A: `docker run --privileged`
-- Grants ~40 Linux capabilities to the inner container.
-- Disables seccomp and AppArmor/SELinux confinement.
-- All host devices accessible.
-- A `--privileged` container can escape via mount, device access, or kernel module load.
-
-### Option B: `-v /var/run/docker.sock:/var/run/docker.sock`
-- The inner `docker` command is a client talking to the host daemon.
-- Containers launched "inside" are actually the host's containers.
-- Any such container can mount host `/` — full host compromise.
-- This is fake nesting: sibling containers, not nested ones.
-
-See [docker-equivalent-fails.md](docker-equivalent-fails.md) for the full breakdown.
-
-## Why Podman is structurally different
-
-- **No daemon** — each `podman` invocation is a fork+exec CLI.
-- **User namespaces actually nest** (up to kernel limits; see subuid/subgid).
-- **fuse-overlayfs** gives overlay storage inside an unprivileged user namespace.
-- **slirp4netns** (or pasta) gives per-container userspace networking — no shared iptables.
-
-The inner container is nested, not a sibling, and no host capability is granted.
+| | Outer `CapBnd` | Seccomp | Inner isolation |
+| --- | --- | --- | --- |
+| `docker run --privileged` | 38+ caps (all) | **off** | weak — escape is trivial |
+| `-v /var/run/docker.sock` | Docker default (14 caps) | default | **none** — "inner" containers are host's |
+| **This repo** | 15 caps (default + `SYS_ADMIN`) | off | **real nested userns + overlay + netns** |
 
 ## Run it
 
-**Scenario 1 (podman-outer):** Requires rootless podman on the host.
-```bash
-./run.sh
-```
+One-time host setup (Ubuntu 24.04+ only — older distros skip this step):
 
-**Scenario 2 (docker-outer — for Jenkins-style CI):** Requires Docker on the host. On Ubuntu 24.04+ also requires loading a tiny AppArmor profile once:
 ```bash
-# one-time (CI host setup — can be in a golden image / provisioning tool)
 sudo install -m 0644 docker-outer/apparmor-profile/podman-nested.apparmor /etc/apparmor.d/podman-nested
 sudo apparmor_parser -r /etc/apparmor.d/podman-nested
+```
 
-# then:
+Then run the demo (builds an Ubuntu+Podman image, runs it via Docker, runs `hello-world` nested inside):
+
+```bash
 docker-outer/run.sh
 ```
 
-Tested on Ubuntu 24.04 host with Docker 29.3 and Podman 4.9.3 inside.
+`test.sh` at the repo root asserts the scenario actually works (PASS banner present, `Hello from Docker!` present, `CapBnd` is not `--privileged`'s full set). Exit 0 for CI.
 
-## Testing
+## The flag set
 
-`test.sh` at the repo root runs each scenario whose outer runtime is installed and asserts: (a) the scenario exits 0, (b) the `PASS` banner appears, (c) `Hello from Docker!` from the nested workload appears, (d) `CapBnd` is not the `--privileged` value. Scenarios whose outer runtime isn't installed are skipped. Exit code: 0 = every runnable scenario passed, 1 = at least one failed, 2 = nothing runnable.
-
-```
-$ ./test.sh
-[podman-outer] SKIP (podman not on $PATH)
-[docker-outer] running ./docker-outer/run.sh ... PASS
-```
-
-## Outer-container flags
-
-### Scenario 1 — podman-outer
-
-| Flag | Purpose | Is this "privilege"? |
-| --- | --- | --- |
-| `--user podman` | Run the outer container as the `podman` user (UID 1000 in image), which has `/etc/subuid` + `/etc/subgid` entries so the inner podman gets a proper nested userns range. | No — drops privilege (UID 1000, not 0) |
-| `--device /dev/fuse` | For fuse-overlayfs inside the userns. | No — exposes one device, not all of `/dev` |
-| `--security-opt label=disable` | Disable SELinux label confinement. No-op on AppArmor. | No — only relevant under SELinux |
-| `--security-opt unmask=ALL` | Undo podman's defence-in-depth masking of certain `/proc` and `/sys` subpaths. | No — no caps added, no host paths mounted, seccomp still active |
-
-**Not used:** `--privileged`, `-v /var/run/docker.sock`, `--cap-add`, `--userns=host`, `--net=host`, `seccomp=unconfined`. **`CapEff=0`** inside the container — zero effective capabilities.
-
-### Scenario 2 — docker-outer
-
-| Flag | Purpose | Is this "privilege"? |
-| --- | --- | --- |
-| `--device /dev/fuse` | For fuse-overlayfs inside the inner container. | No |
-| `--device /dev/net/tun` | For slirp4netns userspace networking inside the inner container. | No — single device |
-| `--cap-add=SYS_ADMIN` | Docker's default cap bounding set excludes `SYS_ADMIN`, but the kernel requires it on the `uid_map` write path. Without it, setuid-root `newuidmap` cannot gain `SYS_ADMIN` transiently and nested userns setup fails. | **One cap added.** The container still runs as UID 1000 with `CapEff=0`; only setuid binaries inside (newuidmap, newgidmap) can use this transiently. |
-| `--security-opt apparmor=podman-nested` | Minimal 4-line AppArmor profile (`flags=(unconfined) { userns }`). On Ubuntu 24.04+ the kernel requires an AppArmor profile with an explicit `userns` grant for unprivileged userns operations. Profile adds *zero* restrictions beyond the container's cap set and seccomp. | No |
-| `--security-opt seccomp=unconfined` | Docker's default seccomp profile blocks some `unshare`/`mount` syscalls the inner runtime needs. | Yes, seccomp turned off. But AppArmor and cap set still enforce. |
-| `--security-opt systempaths=unconfined` | Restores `/proc` + `/sys` view (Docker masks these by default). | No — only restores visibility, no writes |
-
-**Not used:** `--privileged`, `-v /var/run/docker.sock`, `--userns=host`, `--net=host`.
-
-Bounding set comparison:
-
-| Mode | `CapBnd` | Cap count |
-| --- | --- | --- |
-| This PoC, podman-outer | `0x00000000800405fb` | 11 |
-| This PoC, docker-outer | `0x00000000a82425fb` | 15 (Docker default 14 + `SYS_ADMIN`) |
-| Docker `--privileged` | `0x000001ffffffffff` | 38+ |
-
-The docker-outer path gives up more than the podman-outer path (`SYS_ADMIN` + `seccomp=unconfined`) — but it's what you can do *inside an existing Docker-based CI agent* without demanding a switch to podman as the CI container runtime.
-
-## Example output
-
-Abbreviated from an actual run on Ubuntu 24.04 / Podman 4.9.3:
-
-```
-[1] Identity — inner root is NOT host root
-    whoami:  podman
-    UID:     1000
-    userns:  user:[4026532584]
-    uid_map:    0  1000      1
-                1  100000   65536               <- nested userns mapping
-
-[2] Capability bounds — contrast with Docker --privileged (CapBnd=0x000001ffffffffff)
-    CapInh:  0000000000000000
-    CapPrm:  0000000000000000
-    CapEff:  0000000000000000                   <- ZERO effective caps
-    CapBnd:  00000000800405fb                   <- 11 caps, none dangerous
-    CapAmb:  0000000000000000
-
-[3] PASS: no docker/podman socket found
-
-[4] podman version 4.9.4
-
-[5] driver: overlay / cgroup: v2 / runtime: crun
-
-[6] <empty>                                     <- inner store is separate
-
-[7] interfaces: lo tap0                         <- own slirp4netns
-
-[8] Hello from Docker!                          <- nested workload ran
-    ...
-
-=== PASS: nested container ran rootless, no --privileged, no socket mount ===
-          (isolated userns + caps + store + net)
+```bash
+docker run --rm \
+  --device /dev/fuse \                       # for fuse-overlayfs storage
+  --device /dev/net/tun \                    # for slirp4netns networking
+  --cap-add=SYS_ADMIN \                      # so setuid newuidmap can write uid_map
+  --security-opt apparmor=podman-nested \    # Ubuntu 24.04+ userns grant (4-line profile)
+  --security-opt seccomp=unconfined \        # Docker default blocks some unshare/mount
+  --security-opt systempaths=unconfined \    # restore /proc + /sys visibility inside
+  podman-in-docker:local
 ```
 
-The key contrast: Docker's `--privileged` produces `CapBnd=0x000001ffffffffff` (38 caps). This PoC produces `CapEff=0x0000000000000000` (0 effective caps) and `CapBnd=0x00000000800405fb` (11 caps, none of the dangerous ones).
+**Not used**: `--privileged`, `-v /var/run/docker.sock`, `--userns=host`, `--net=host`, any other `--cap-add`.
+
+### What each flag actually concedes
+
+- **`--device /dev/fuse`, `--device /dev/net/tun`** — two device nodes. `--privileged` exposes every device under `/dev`.
+- **`--cap-add=SYS_ADMIN`** — one capability, added to the bounding set. The container still runs as UID 1000 with `CapEff=0`; only setuid binaries (`newuidmap`, `newgidmap`, `mount`) can exercise this cap, transiently.
+- **`--security-opt apparmor=podman-nested`** — the profile is literally `flags=(unconfined) { userns }`. Four lines. It adds no restrictions beyond what the cap set + seccomp already enforce; it only satisfies the Ubuntu 24.04+ kernel requirement that unprivileged userns work happens under a named AppArmor profile with an explicit `userns` grant.
+- **`--security-opt seccomp=unconfined`** — turns off Docker's default seccomp profile because it blocks syscalls (`unshare`, various `mount` variants) the inner runtime needs. Cap set and AppArmor still enforce.
+- **`--security-opt systempaths=unconfined`** — Docker masks a handful of `/proc` and `/sys` subpaths by default; the inner runtime needs standard visibility to set up its own `/proc`. No write access is granted that wasn't already.
+
+## What the demo verifies
+
+`inner-demo.sh` runs eight self-checks inside the outer container, with `set -euo pipefail` — any failure bails, so the final `=== PASS ===` banner only prints if everything worked:
+
+1. **Identity** — `whoami`, UID, userns, `uid_map`.
+2. **Capability bounds** — `grep '^Cap' /proc/self/status`. Explicitly contrasted with `--privileged`'s `CapBnd=0x000001ffffffffff`.
+3. **No host container socket mounted** — fails loudly if `/var/run/docker.sock` or a Podman socket is present; forces the demo to be real nesting, not fake-nesting-via-socket-share.
+4. **Outer podman version**.
+5. **Storage driver is overlay, rootless**.
+6. **`podman ps -a` is empty** — proves the inner podman has its own graph root, not a view into the host's.
+7. **Network interfaces** — shows the container has its own netns.
+8. **Actual nested workload** — `podman run --rm docker.io/library/hello-world` runs and prints "Hello from Docker!".
+
+## Wiring this into Jenkins
+
+1. In your CI agent's Dockerfile, add `podman fuse-overlayfs slirp4netns uidmap dbus-user-session` to the apt (or equivalent) install line. Add `/etc/subuid` + `/etc/subgid` entries for the agent user (`<user>:100000:65536` is typical).
+2. On each CI host, load `podman-nested.apparmor` once. Golden image, Puppet, Ansible, whatever you use for host provisioning. Only needed on Ubuntu 24.04+.
+3. In the Jenkinsfile's agent config or the `docker.image().inside(...)` invocation, pass the six `--device` / `--cap-add` / `--security-opt` flags above.
+4. Point Testcontainers at the agent's rootless Podman socket:
+   ```
+   DOCKER_HOST=unix:///run/user/1000/podman/podman.sock
+   TESTCONTAINERS_RYUK_DISABLED=true
+   ```
+   The `docker-outer/Containerfile` in this repo already sets this up as an example.
 
 ## Caveats
 
-- **cgroups v2** is required. Standard on Ubuntu 22.04+, Fedora 31+.
-- `/etc/subuid` and `/etc/subgid` must have an entry for your *host* user — typically `<user>:100000:65536`. The Ansible playbook that provisioned this repo's test VM adds this automatically.
-- Kernel ≥ 5.11 recommended for reliable unprivileged userns overlay.
-- `--user podman` is specific to the `quay.io/podman/stable` image's built-in user (it has pre-configured subuid entries). On Podman 5.x, the default mapping may work without this.
-- The Containerfile configures `mirror.gcr.io` as a pull-through cache for docker.io to dodge Docker Hub's 100-pull/6h anonymous rate limit during the nested `hello-world` pull. See `registries.conf`.
+- **cgroups v2** required. Standard on Ubuntu 22.04+, RHEL 9+, Fedora 31+.
+- **Kernel ≥ 5.11** recommended for reliable unprivileged userns + overlay.
+- **Ubuntu 24.04+** hosts need the AppArmor profile loaded. Older or non-Ubuntu hosts don't.
+- Not tested on cgroups v1 hosts, Docker daemons with `userns-remap` enabled, or Kubernetes pod executors.
 
-## What is not claimed
+## Not claimed
 
-- Not a security audit.
-- Not a migration guide.
-- Not a perf comparison.
-
-Scope is deliberately narrow: demonstrate one specific thing.
+- **Not a security audit.** `--cap-add=SYS_ADMIN` + `seccomp=unconfined` are real concessions — just orders of magnitude narrower than `--privileged`.
+- **Not a migration guide.** `hello-world` is smaller than your real test workload; real pipelines have more moving parts.
+- See [`docker-equivalent-fails.md`](./docker-equivalent-fails.md) for what `docker --privileged` and socket-mounting each give up in full.
