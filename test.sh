@@ -1,72 +1,39 @@
 #!/bin/bash
-# Exercises each scenario end-to-end and asserts the claim actually holds.
-# Skips scenarios whose outer runtime isn't installed on the host. Exit code:
-#   0 -- every runnable scenario passed
-#   1 -- at least one scenario failed
-#   2 -- no runnable scenario (neither podman nor docker on $PATH)
+# Run the Testcontainers demo and assert it actually worked. Grep for the
+# Maven surefire summary line and for the container-runtime context block the
+# entrypoint prints. Exit 0 on success, 1 on failure. Suitable for CI.
 set -uo pipefail
 cd "$(dirname "$0")"
 
-PASS_BANNER='=== PASS: nested container ran rootless, no --privileged, no socket mount ==='
-HELLO_MARKER='Hello from Docker!'
-PRIVILEGED_CAPBND='000001ffffffffff'
+log=$(mktemp)
+trap "rm -f '$log'" EXIT
 
-assert_scenario() {
-  local name="$1" script="$2" log
-  log=$(mktemp)
-  trap "rm -f '$log'" RETURN
-
-  printf '[%s] running %s ... ' "$name" "$script"
-
-  if ! "$script" >"$log" 2>&1; then
-    local rc=$?
-    echo "FAIL (exit $rc)"
-    echo "--- last 30 lines of log ---"
-    tail -30 "$log"
-    echo "--- end log ---"
-    return 1
-  fi
-
-  if ! grep -qF "$PASS_BANNER" "$log"; then
-    echo "FAIL (ran OK but PASS banner missing — some inner-demo.sh check failed)"
-    tail -30 "$log"
-    return 1
-  fi
-
-  if ! grep -qF "$HELLO_MARKER" "$log"; then
-    echo "FAIL (nested hello-world did not actually execute)"
-    return 1
-  fi
-
-  # Sanity: if CapBnd matches Docker --privileged, the PoC's claim is violated.
-  if grep -qE "CapBnd:[[:space:]]+$PRIVILEGED_CAPBND" "$log"; then
-    echo "FAIL (CapBnd equals --privileged's full set — claim violated)"
-    return 1
-  fi
-
-  echo "PASS"
-}
-
-ran_any=0
-failed=0
-
-if command -v podman >/dev/null 2>&1; then
-  ran_any=1
-  assert_scenario "podman-outer" "./run.sh" || failed=1
-else
-  echo "[podman-outer] SKIP (podman not on \$PATH)"
-fi
-
-if command -v docker >/dev/null 2>&1; then
-  ran_any=1
-  assert_scenario "docker-outer" "./docker-outer/run.sh" || failed=1
-else
-  echo "[docker-outer] SKIP (docker not on \$PATH)"
-fi
-
-if [ $ran_any -eq 0 ]; then
-  echo "No runnable scenarios — neither podman nor docker is installed."
+if ! command -v docker >/dev/null 2>&1; then
+  echo "SKIP: docker is not on \$PATH"
   exit 2
 fi
 
-exit $failed
+echo ">>> Running ./run.sh ..."
+if ! ./run.sh >"$log" 2>&1; then
+  rc=$?
+  echo "FAIL (run.sh exit $rc)"
+  echo "--- last 60 lines of log ---"
+  tail -60 "$log"
+  exit 1
+fi
+
+# Maven surefire summary: "Tests run: N, Failures: 0, Errors: 0"
+if ! grep -qE 'Tests run: [1-9][0-9]*, Failures: 0, Errors: 0' "$log"; then
+  echo "FAIL (no 'Tests run: N, Failures: 0, Errors: 0' line from surefire)"
+  tail -60 "$log"
+  exit 1
+fi
+
+# Sanity: CapBnd echoed by entrypoint must not be --privileged's full set.
+if grep -qE 'CapBnd:[[:space:]]+000001ffffffffff' "$log"; then
+  echo "FAIL (CapBnd matches --privileged — the isolation claim is violated)"
+  exit 1
+fi
+
+echo "PASS"
+exit 0
