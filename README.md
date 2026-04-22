@@ -1,8 +1,13 @@
 # podman-dind-poc
 
-**Claim: Podman runs a truly nested container rootlessly, without `--privileged` and without mounting any host socket.**
+**Claim: Rootless podman can run a truly nested container with minimal flags — without `--privileged` and without mounting the host container socket.**
 
-This PoC backs that claim with a single script. The outer container runs a rootless podman binary. Inside it, a second `podman run` launches an unrelated workload (`hello-world`) that goes through its own user namespace, its own overlay filesystem, its own network namespace, and its own container store.
+Two scenarios in this repo:
+
+- **[podman-outer](./Containerfile)** (top level) — outer container is `quay.io/podman/stable` run via *host* podman. This is the purest demonstration: the nested workload runs inside a container whose process has `CapEff=0` (zero effective capabilities).
+- **[docker-outer](./docker-outer/)** — outer container is a purpose-built Ubuntu + podman image run via *host* Docker. Targets Jenkins / GitLab CI setups that wrap their entire test run in a Docker agent. Slightly wider flag set than podman-outer (one extra capability: `SYS_ADMIN`) but vastly narrower than Docker-in-Docker's `--privileged`.
+
+In both cases the outer container runs a rootless podman binary. Inside it, a second `podman run` launches an unrelated workload (`hello-world`) that goes through its own user namespace, its own overlay filesystem, its own network namespace, and its own container store.
 
 ## Why this matters: Docker's two D-in-D workarounds
 
@@ -33,22 +38,58 @@ The inner container is nested, not a sibling, and no host capability is granted.
 
 ## Run it
 
+**Scenario 1 (podman-outer):** Requires rootless podman on the host.
 ```bash
 ./run.sh
 ```
 
-Requires rootless podman on the host. Tested on Ubuntu 24.04 with Podman 4.9.3.
+**Scenario 2 (docker-outer — for Jenkins-style CI):** Requires Docker on the host. On Ubuntu 24.04+ also requires loading a tiny AppArmor profile once:
+```bash
+# one-time (CI host setup — can be in a golden image / provisioning tool)
+sudo install -m 0644 docker-outer/apparmor-profile/podman-nested.apparmor /etc/apparmor.d/podman-nested
+sudo apparmor_parser -r /etc/apparmor.d/podman-nested
 
-## Outer-container flags used (and what each is for)
+# then:
+docker-outer/run.sh
+```
+
+Tested on Ubuntu 24.04 host with Docker 29.3 and Podman 4.9.3 inside.
+
+## Outer-container flags
+
+### Scenario 1 — podman-outer
 
 | Flag | Purpose | Is this "privilege"? |
 | --- | --- | --- |
-| `--user podman` | Run the outer container as the `podman` user (UID 1000 in image), which has `/etc/subuid` + `/etc/subgid` entries so the inner podman gets a proper nested userns range. Without this, you fall back to "rootless single mapping" and the inner runtime breaks on devpts. | No — drops privilege (runs as UID 1000, not 0, in the outer) |
-| `--device /dev/fuse` | Single device node so the inner podman can use fuse-overlayfs for overlay storage inside the userns. | No — exposes one device, not the ~200 that `--privileged` exposes |
-| `--security-opt label=disable` | Disable SELinux label confinement. No-op on AppArmor/Ubuntu; prevents AVC denials on RHEL/Fedora hosts. | No — only relevant under SELinux |
-| `--security-opt unmask=ALL` | Undo podman's default masking of certain `/proc` and `/sys` subpaths (defence-in-depth masking). The inner runtime needs a standard `/proc`, `/sys`, and devpts view to set up its own mounts. | No — no caps added, no host paths mounted, seccomp still active |
+| `--user podman` | Run the outer container as the `podman` user (UID 1000 in image), which has `/etc/subuid` + `/etc/subgid` entries so the inner podman gets a proper nested userns range. | No — drops privilege (UID 1000, not 0) |
+| `--device /dev/fuse` | For fuse-overlayfs inside the userns. | No — exposes one device, not all of `/dev` |
+| `--security-opt label=disable` | Disable SELinux label confinement. No-op on AppArmor. | No — only relevant under SELinux |
+| `--security-opt unmask=ALL` | Undo podman's defence-in-depth masking of certain `/proc` and `/sys` subpaths. | No — no caps added, no host paths mounted, seccomp still active |
 
-**Not used:** `--privileged`, `-v /var/run/docker.sock`, `--cap-add`, `--userns=host`, `--net=host`, `seccomp=unconfined`.
+**Not used:** `--privileged`, `-v /var/run/docker.sock`, `--cap-add`, `--userns=host`, `--net=host`, `seccomp=unconfined`. **`CapEff=0`** inside the container — zero effective capabilities.
+
+### Scenario 2 — docker-outer
+
+| Flag | Purpose | Is this "privilege"? |
+| --- | --- | --- |
+| `--device /dev/fuse` | For fuse-overlayfs inside the inner container. | No |
+| `--device /dev/net/tun` | For slirp4netns userspace networking inside the inner container. | No — single device |
+| `--cap-add=SYS_ADMIN` | Docker's default cap bounding set excludes `SYS_ADMIN`, but the kernel requires it on the `uid_map` write path. Without it, setuid-root `newuidmap` cannot gain `SYS_ADMIN` transiently and nested userns setup fails. | **One cap added.** The container still runs as UID 1000 with `CapEff=0`; only setuid binaries inside (newuidmap, newgidmap) can use this transiently. |
+| `--security-opt apparmor=podman-nested` | Minimal 4-line AppArmor profile (`flags=(unconfined) { userns }`). On Ubuntu 24.04+ the kernel requires an AppArmor profile with an explicit `userns` grant for unprivileged userns operations. Profile adds *zero* restrictions beyond the container's cap set and seccomp. | No |
+| `--security-opt seccomp=unconfined` | Docker's default seccomp profile blocks some `unshare`/`mount` syscalls the inner runtime needs. | Yes, seccomp turned off. But AppArmor and cap set still enforce. |
+| `--security-opt systempaths=unconfined` | Restores `/proc` + `/sys` view (Docker masks these by default). | No — only restores visibility, no writes |
+
+**Not used:** `--privileged`, `-v /var/run/docker.sock`, `--userns=host`, `--net=host`.
+
+Bounding set comparison:
+
+| Mode | `CapBnd` | Cap count |
+| --- | --- | --- |
+| This PoC, podman-outer | `0x00000000800405fb` | 11 |
+| This PoC, docker-outer | `0x00000000a82425fb` | 15 (Docker default 14 + `SYS_ADMIN`) |
+| Docker `--privileged` | `0x000001ffffffffff` | 38+ |
+
+The docker-outer path gives up more than the podman-outer path (`SYS_ADMIN` + `seccomp=unconfined`) — but it's what you can do *inside an existing Docker-based CI agent* without demanding a switch to podman as the CI container runtime.
 
 ## Example output
 

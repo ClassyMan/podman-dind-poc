@@ -1,0 +1,25 @@
+# Minimal AppArmor profile for Docker containers that run rootless podman inside.
+#
+# Purpose: on Ubuntu 24.04+ with kernel.apparmor_restrict_unprivileged_userns=1,
+# processes under the default "unconfined" AppArmor context cannot write
+# /proc/PID/uid_map when setting up a nested user namespace. A profile with an
+# explicit 'userns' grant is required.
+#
+# This profile is 'flags=(unconfined)' — it adds *no* restrictions beyond the
+# container's capability set + seccomp profile. It is strictly narrower than
+# running with --privileged.
+#
+# Install once on the CI host (typically in a golden image or provisioning
+# tool):
+#   sudo install -m 0644 podman-nested.apparmor /etc/apparmor.d/podman-nested
+#   sudo apparmor_parser -r /etc/apparmor.d/podman-nested
+#
+# Then reference it from docker run:
+#   docker run --security-opt apparmor=podman-nested ...
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile podman-nested flags=(unconfined) {
+  userns,
+}
