@@ -2,7 +2,7 @@
 
 **How to run Testcontainers tests from a Docker-wrapped CI agent without `--privileged` or `/var/run/docker.sock`, using only upstream open-source components: rootless Podman, Testcontainers, and a 4-line AppArmor profile.**
 
-Verified end-to-end by a JUnit 5 + Testcontainers test that spawns a Postgres container and runs `SELECT 42` over JDBC. See [Verify the pattern](#verify-the-pattern) at the bottom.
+Verified end-to-end by a JUnit 5 + Testcontainers test that spawns a LocalStack container, PUTs an object into its S3 API, GETs it back, and asserts the round-trip via the AWS SDK v2. See [Verify the pattern](#verify-the-pattern) at the bottom.
 
 ## The problem
 
@@ -108,7 +108,7 @@ Three env vars for Testcontainers:
 
 ### 4. Your Maven deps — nothing Podman-specific
 
-Standard Testcontainers artefacts:
+Standard Testcontainers artefacts. The concrete example below uses LocalStack + the AWS SDK v2 S3 client; swap the module + client for whatever backing service your tests actually need (`kafka`, `mongodb`, `rabbitmq`, etc.):
 
 ```xml
 <dependency>
@@ -125,11 +125,17 @@ Standard Testcontainers artefacts:
 </dependency>
 <dependency>
   <groupId>org.testcontainers</groupId>
-  <artifactId>postgresql</artifactId>
+  <artifactId>localstack</artifactId>
   <version>1.20.4</version>
   <scope>test</scope>
 </dependency>
-<!-- plus junit-jupiter-api, junit-jupiter-engine, org.postgresql:postgresql -->
+<dependency>
+  <groupId>software.amazon.awssdk</groupId>
+  <artifactId>s3</artifactId>
+  <version>2.29.52</version>
+  <scope>test</scope>
+</dependency>
+<!-- plus junit-jupiter-api and junit-jupiter-engine -->
 ```
 
 Test code is exactly what you'd write with Docker:
@@ -139,18 +145,34 @@ Test code is exactly what you'd write with Docker:
 class MyIntegrationTest {
 
     @Container
-    static final PostgreSQLContainer<?> POSTGRES =
-        new PostgreSQLContainer<>("postgres:16-alpine");
+    static final LocalStackContainer LOCALSTACK =
+        new LocalStackContainer(DockerImageName.parse("localstack/localstack:3.8"))
+            .withServices(S3);
+
+    private static S3Client s3;
+
+    @BeforeAll
+    static void setUp() {
+        s3 = S3Client.builder()
+            .endpointOverride(LOCALSTACK.getEndpointOverride(S3))
+            .credentialsProvider(StaticCredentialsProvider.create(
+                AwsBasicCredentials.create(LOCALSTACK.getAccessKey(), LOCALSTACK.getSecretKey())))
+            .region(Region.of(LOCALSTACK.getRegion()))
+            .build();
+        s3.createBucket(CreateBucketRequest.builder().bucket("my-bucket").build());
+    }
 
     @Test
-    void postgresIsReachable() throws Exception {
-        try (var conn = DriverManager.getConnection(
-                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
-             var stmt = conn.createStatement();
-             var rs = stmt.executeQuery("SELECT 42 AS answer")) {
-            assertTrue(rs.next());
-            assertEquals(42, rs.getInt("answer"));
-        }
+    void s3PutAndGetRoundTrip() {
+        s3.putObject(
+            PutObjectRequest.builder().bucket("my-bucket").key("hello.txt").build(),
+            RequestBody.fromString("Hello from podman-in-docker!"));
+
+        String retrieved = s3.getObjectAsBytes(
+            GetObjectRequest.builder().bucket("my-bucket").key("hello.txt").build()
+        ).asUtf8String();
+
+        assertEquals("Hello from podman-in-docker!", retrieved);
     }
 }
 ```
@@ -192,7 +214,7 @@ docker run --rm \
 ## Not claimed
 
 - Not a security audit. `--cap-add=SYS_ADMIN` + `seccomp=unconfined` are real concessions — just orders of magnitude narrower than `--privileged`.
-- Not a migration guide. `postgres:16-alpine` is smaller than your real test workload.
+- Not a migration guide. LocalStack + the single S3 put/get round-trip here is smaller than your real test workload.
 - See [`docker-equivalent-fails.md`](./docker-equivalent-fails.md) for a deeper breakdown of what `--privileged` and socket-mount each give up.
 
 ## Verify the pattern
