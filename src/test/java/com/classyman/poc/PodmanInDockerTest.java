@@ -16,8 +16,7 @@ import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.testcontainers.containers.localstack.LocalStackContainer.Service.S3;
 
 @Testcontainers
@@ -47,8 +46,9 @@ class PodmanInDockerTest {
 
     @Test
     void localstackContainerIsRunning() {
-        assertTrue(LOCALSTACK.isRunning(),
-            "Testcontainers should have started the LocalStack container via the Podman docker-compat socket");
+        assertThat(LOCALSTACK.isRunning())
+            .as("Testcontainers should have started the LocalStack container via the Podman docker-compat socket")
+            .isTrue();
     }
 
     @Test
@@ -61,7 +61,8 @@ class PodmanInDockerTest {
             GetObjectRequest.builder().bucket(BUCKET).key(KEY).build()
         ).asUtf8String();
 
-        assertEquals(CONTENT, retrieved,
-            "S3 object retrieved from LocalStack should match what was put");
+        assertThat(retrieved)
+            .as("S3 object retrieved from LocalStack should match what was put")
+            .isEqualTo(CONTENT);
     }
 }

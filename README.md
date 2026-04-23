@@ -135,10 +135,16 @@ Standard Testcontainers artefacts. The concrete example below uses LocalStack + 
   <version>2.29.52</version>
   <scope>test</scope>
 </dependency>
+<dependency>
+  <groupId>org.assertj</groupId>
+  <artifactId>assertj-core</artifactId>
+  <version>3.26.3</version>
+  <scope>test</scope>
+</dependency>
 <!-- plus junit-jupiter-api and junit-jupiter-engine -->
 ```
 
-Test code is exactly what you'd write with Docker:
+Test code is exactly what you'd write with Docker. The snippet below uses AssertJ for assertions:
 
 ```java
 @Testcontainers
@@ -172,10 +178,12 @@ class MyIntegrationTest {
             GetObjectRequest.builder().bucket("my-bucket").key("hello.txt").build()
         ).asUtf8String();
 
-        assertEquals("Hello from podman-in-docker!", retrieved);
+        assertThat(retrieved).isEqualTo("Hello from podman-in-docker!");
     }
 }
 ```
+
+See [**MORE_EXAMPLES.md**](./MORE_EXAMPLES.md) for copy-paste-ready Testcontainers patterns covering PostgreSQL (SQL), Kafka (events), Redis (cache/KV), MongoDB (documents), and the `GenericContainer` escape hatch for any HTTP service.
 
 ### 5. Run your agent container with the minimal flag set
 
