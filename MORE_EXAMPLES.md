@@ -9,6 +9,7 @@ Every example assumes the setup in the [main README](./README.md) — rootless P
 - [Redis (Jedis key/value)](#redis-jedis-keyvalue)
 - [MongoDB (document insert/find)](#mongodb-document-insertfind)
 - [GenericContainer (any image, HTTP probe via nginx)](#genericcontainer-any-image-http-probe-via-nginx)
+- [Your own Spring Boot app (WAR in Tomcat, or executable JAR)](#your-own-spring-boot-app-war-in-tomcat-or-executable-jar)
 
 ---
 
@@ -345,3 +346,100 @@ class NginxTest {
     }
 }
 ```
+
+---
+
+## Your own Spring Boot app (WAR in Tomcat, or executable JAR)
+
+**Use when:** you want a black-box integration test against your actual deployed artefact — the real Spring context wired up, the real servlet container, the real embedded server. Two common shapes depending on how you build.
+
+### Shape A — you ship a WAR, drop it into Tomcat
+
+Simplest when you've already got a `target/myapp.war` and you want a plain vanilla servlet container around it.
+
+```java
+package com.classyman.poc;
+
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+import org.testcontainers.utility.MountableFile;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Path;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@Testcontainers
+class SpringBootWarTest {
+
+    private static final int HTTP_PORT = 8080;
+    private static final Path WAR_PATH = Path.of("target/myapp.war");
+
+    @Container
+    static final GenericContainer<?> APP =
+        new GenericContainer<>(DockerImageName.parse("tomcat:10.1-jdk21"))
+            .withCopyFileToContainer(
+                MountableFile.forHostPath(WAR_PATH),
+                "/usr/local/tomcat/webapps/ROOT.war")
+            .withExposedPorts(HTTP_PORT)
+            // Spring Boot apps usually expose /actuator/health; swap for your readiness probe.
+            .waitingFor(Wait.forHttp("/actuator/health").forStatusCode(200));
+
+    @Test
+    void greetingEndpointRespondsOk() throws Exception {
+        URI endpoint = URI.create(
+            "http://" + APP.getHost() + ":" + APP.getMappedPort(HTTP_PORT) + "/greeting");
+
+        HttpResponse<String> response = HttpClient.newHttpClient().send(
+            HttpRequest.newBuilder(endpoint).build(),
+            HttpResponse.BodyHandlers.ofString());
+
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(response.body()).contains("hello");
+    }
+}
+```
+
+**Maven ordering gotcha:** Surefire (unit tests) runs *before* `package`, so at `mvn test` time the WAR doesn't exist yet. Either:
+
+- Name the test `*IT.java` and let Failsafe run it during `mvn verify` (after the WAR is packaged), **or**
+- Add `maven-war-plugin` execution to an earlier phase, **or**
+- Run `mvn package` explicitly before invoking the tests.
+
+### Shape B — Spring Boot executable JAR, no servlet container image
+
+If your Spring Boot app uses the default embedded Tomcat/Jetty (most do), skip the Tomcat image and just build a minimal JRE image around your JAR. This is simpler and faster to start.
+
+```java
+@Container
+static final GenericContainer<?> APP =
+    new GenericContainer<>(
+        new org.testcontainers.images.builder.ImageFromDockerfile()
+            .withFileFromPath("myapp.jar", Path.of("target/myapp.jar"))
+            .withDockerfileFromBuilder(b -> b
+                .from("eclipse-temurin:21-jre")
+                .add("myapp.jar", "/app/myapp.jar")
+                .entryPoint("java", "-jar", "/app/myapp.jar")
+                .build()))
+        .withExposedPorts(8080)
+        .waitingFor(Wait.forHttp("/actuator/health").forStatusCode(200));
+```
+
+This builds a one-off image on each test run (not great for throughput). In a real CI pipeline you'd usually:
+
+1. Have `mvn package` (or `bootBuildImage`) produce `myapp:${build.number}`.
+2. Reference the pre-built tag from the test with `new GenericContainer<>("myapp:${build.number}")`.
+
+### Caveats specific to Spring Boot
+
+- **Cold start.** JVM + Spring context init is slower than a bare service; bump the wait-strategy timeout to 60–120 s for anything real.
+- **Memory.** Tomcat + Spring easily passes 500 MB RSS. If your CI agent is tight, give the container an explicit limit via `.withCreateContainerCmdModifier(...)` or a compose file.
+- **Profiles and config.** Pass test-specific config via env vars: `.withEnv("SPRING_PROFILES_ACTIVE", "integration")`, `.withEnv("SPRING_DATASOURCE_URL", ...)`. Testcontainers plays nicely with spring-boot-testcontainers (the Spring Boot integration module) if you want `@ServiceConnection` wiring.
+- **Build–test ordering** is the thing people hit most often — see the Surefire/Failsafe note above.
